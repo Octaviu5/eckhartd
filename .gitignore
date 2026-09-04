@@ -1,0 +1,21 @@
+# Personal config — never commit your real policy
+rules.json
+state.json
+
+# Runtime socket dir
+/tmp/eckhart/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+hooks/

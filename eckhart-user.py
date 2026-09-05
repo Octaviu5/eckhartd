@@ -4,6 +4,12 @@ import os
 import dbus
 import time
 import argparse
+import sys
+from datetime import datetime
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RULES_PATH = os.path.join(SCRIPT_DIR, "rules.json")
+STATE_PATH = f"/tmp/eckhart/{os.getuid()}.state"    
 
 # --- CONFIG ---
 UID = os.getuid()
@@ -19,6 +25,7 @@ MILESTONES = {3600: "60 MINUTES REMAINING", 2700: "45 MINUTES REMAINING", 1800: 
 # --- CLI ARGS ---
 parser = argparse.ArgumentParser()
 parser.add_argument("-v", "--verbose", action="store_true", help="Show logic in terminal")
+parser.add_argument("-s", "--status", action="store_true", help="Print current status snapshot and exit")
 args = parser.parse_args()
 
 # --- DBUS SETUP ---
@@ -69,9 +76,139 @@ def format_binaries(binary_list):
         return ""
     return "\n".join(f" - {os.path.basename(b)}" for b in sorted(set(binary_list)))
 
+def get_day_key():
+    return datetime.now().strftime("%a").lower()
+
+def load_json_file(path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def print_cli_status():
+    rules_data = load_json_file(RULES_PATH)
+    state_data = load_json_file(STATE_PATH)
+
+    RST   = "\033[0m"
+    BOLD  = "\033[1m"
+    DIM   = "\033[2m"
+    ACC   = "\033[36m"          # Minimal accent: Cyan
+    MUTED = "\033[38;5;238m"     # Dark slate/gray for lines
+
+    if not state_data:
+        print(f"{DIM}[!] ERROR: COULD NOT READ STATE FROM {STATE_PATH}{RST}")
+        sys.exit(1)
+
+    profile = rules_data.get(str(UID), {})
+    intentions_cfg = profile.get("intentions", {})
+    days_off_cfg = profile.get("days_off", {})
+
+    now_sec = get_seconds_since_midnight()
+    day_key = get_day_key()
+    today_blocked_bins = [b.upper() for b in days_off_cfg.get(day_key, days_off_cfg.get("def", []))]
+
+    time_blocks = state_data.get("st_time_blocks", {})
+    active_intent = state_data.get("st_intention_name")
+
+    # Fully wipe screen, clear scrollback buffer, and reset cursor to top
+    print("\033[H\033[2J\033[3J", end="", flush=True)
+
+    header_status = f"{BOLD}{ACC}{active_intent.upper()}{RST}" if active_intent else f"{DIM}IDLE{RST}"
+
+    print(f"{MUTED}{'─' * 54}{RST}")
+    print(f"  {BOLD}ECKHARTD{RST}                  ACTIVE INTENTION: {header_status}")
+    print(f"{MUTED}{'─' * 54}{RST}")
+
+    available_now = []
+    upcoming = []
+    depleted = []
+    closed_today = []
+
+    for name, cfg in intentions_cfg.items():
+        day_rule = cfg.get("days", {}).get(day_key, cfg.get("days", {}).get("def"))
+        u_name = name.upper()
+
+        if not day_rule:
+            closed_today.append(f"{DIM}{u_name:<12} (NO SCHEDULE){RST}")
+            continue
+
+        b_data = time_blocks.get(name, {})
+        daily_budget = b_data.get("daily_budget")
+        daily_used = b_data.get("daily_used", 0)
+        daily_rem = float("inf") if daily_budget is None else max(0, daily_budget - daily_used)
+
+        if daily_budget is not None and daily_rem <= 0:
+            depleted.append(f"{DIM}{u_name:<12} DAILY LIMIT ({format_time(daily_used).upper()} / {format_time(daily_budget).upper()}){RST}")
+            continue
+
+        for w in b_data.get("windows", []):
+            r = w["range"]
+            start, end = map(time_to_seconds, r.split("-"))
+            w_budget = w.get("budget")
+            w_used = w.get("used", 0)
+            w_rem = float("inf") if w_budget is None else max(0, w_budget - w_used)
+
+            if start <= now_sec <= end:
+                if w_budget is not None and w_rem <= 0:
+                    depleted.append(f"{DIM}{u_name:<12} WINDOW LIMIT [{r}] ({format_time(w_used).upper()} / {format_time(w_budget).upper()}){RST}")
+                else:
+                    time_until_end = end - now_sec
+                    eff_rem = min(daily_rem, w_rem, time_until_end)
+                    rem_str = "∞" if eff_rem == float("inf") else format_time(eff_rem).upper()
+                    used_str = format_time(daily_used).upper()
+
+                    # Determine bottleneck reason
+                    if eff_rem == float("inf"):
+                        reason = "UL"
+                    elif eff_rem == daily_rem and daily_budget is not None:
+                        reason = "DB"
+                    elif eff_rem == w_rem and w_budget is not None:
+                        reason = "WB"
+                    else:
+                        reason = "TF"
+
+                    available_now.append(
+                        f"   {BOLD}{u_name:<12}{RST} {DIM}{r:<11}{RST}   SPENT: {used_str:<9} REM: {BOLD}{ACC}{rem_str:<8}{RST} {DIM}({reason}){RST}"
+                    )
+            elif now_sec < start:
+                upcoming.append(
+                    f"   {u_name:<12} {DIM}{r}{RST}   STARTS IN {DIM}{format_time(start - now_sec).upper()}{RST}"
+                )
+
+    print(f"\n {BOLD}AVAILABLE{RST}")
+    if available_now:
+        for item in available_now:
+            print(item)
+    else:
+        print(f"   {DIM}NONE{RST}")
+
+    if upcoming:
+        print(f"\n {BOLD}UPCOMING{RST}")
+        for item in upcoming:
+            print(item)
+
+    if depleted:
+        print(f"\n {BOLD}DEPLETED{RST}")
+        for item in depleted:
+            print(f"   {item}")
+
+    has_closed = today_blocked_bins or closed_today
+    if has_closed:
+        print(f"\n {BOLD}CLOSED TODAY{RST}")
+        if today_blocked_bins:
+            print(f"   {DIM}DAY-OFF:{RST} {', '.join(today_blocked_bins)}")
+        for item in closed_today:
+            print(f"   {item}")
+
+    print(f"\n{MUTED}{'─' * 54}{RST}\n")
+    sys.exit(0)
+
+
 def parse_state():
     global current_state, milestone_memory
-    my_state = current_state.get(str(UID))
+    my_state = current_state    .get(str(UID))
     if not my_state: return "NO INTENTION FOUND", False
 
     intent_name  = my_state.get("st_intention_name")
@@ -147,6 +284,10 @@ def parse_state():
 
 
 def main():
+
+    if args.status:
+        print_cli_status()
+
     global current_state
     if args.verbose: print(f"Eckhart UI — UID {UID}")
 

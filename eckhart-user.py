@@ -173,8 +173,22 @@ def print_cli_status():
                         f"   {BOLD}{u_name:<12}{RST} {DIM}{r:<11}{RST}   SPENT: {used_str:<9} REM: {BOLD}{ACC}{rem_str:<8}{RST} {DIM}({reason}){RST}"
                     )
             elif now_sec < start:
+                win_duration = end - start
+                up_rem = min(daily_rem, w_rem, win_duration)
+                up_rem_str = "∞" if up_rem == float("inf") else format_time(up_rem).upper()
+
+                # Determine bottleneck reason for upcoming slot
+                if up_rem == float("inf"):
+                    up_reason = "UNLIMITED"
+                elif up_rem == daily_rem and daily_budget is not None:
+                    up_reason = "DB"
+                elif up_rem == w_rem and w_budget is not None:
+                    up_reason = "WB"
+                else:
+                    up_reason = "TF"
+
                 upcoming.append(
-                    f"   {u_name:<12} {DIM}{r}{RST}   STARTS IN {DIM}{format_time(start - now_sec).upper()}{RST}"
+                    f"   {BOLD}{u_name:<12}{RST} {DIM}{r:<11}{RST}   STARTS IN: {format_time(start - now_sec).upper():<8} REM: {BOLD}{ACC}{up_rem_str:<8}{RST} {DIM}({up_reason}){RST}"
                 )
 
     print(f"\n {BOLD}AVAILABLE{RST}")

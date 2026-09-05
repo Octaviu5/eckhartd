@@ -5,6 +5,7 @@ import dbus
 import time
 import argparse
 import sys
+import re
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,7 @@ MILESTONES = {3600: "60 MINUTES REMAINING", 2700: "45 MINUTES REMAINING", 1800: 
 parser = argparse.ArgumentParser()
 parser.add_argument("-v", "--verbose", action="store_true", help="Show logic in terminal")
 parser.add_argument("-s", "--status", action="store_true", help="Print current status snapshot and exit")
+parser.add_argument("-w", "--week", action="store_true", help="Print 7-day weekly schedule for current user and exit")
 args = parser.parse_args()
 
 # --- DBUS SETUP ---
@@ -98,6 +100,119 @@ def load_json_file(path):
             return json.load(f)
     except Exception:
         return {}
+
+
+def format_seconds_hms(sec):
+    if sec is None:
+        return "FREE"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    if h > 0 and m > 0:
+        return f"{h}h{m}m"
+    elif h > 0:
+        return f"{h}h"
+    elif m > 0:
+        return f"{m}m"
+    return "0m"
+
+def print_cli_weekly():
+    rules_data = load_json_file(RULES_PATH)
+    profile = rules_data.get(str(UID))
+
+    if not profile:
+        print(f"\033[2m[!] No profile configured for UID {UID} in {RULES_PATH}\033[0m")
+        sys.exit(1)
+
+    today_k = get_day_key()
+    ordered_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+    print("\033[96m[+] WEEKLY INTENTION SCHEDULE (UID: " + str(UID) + " | Today: " + today_k.upper() + ")\033[0m\n")
+
+    intentions = profile.get("intentions", {})
+    for name, config in intentions.items():
+        print(f"  \033[1;37m[{name.upper()}]\033[0m")
+        sched = config.get("schedule", config.get("days", {}))
+
+        # Flatten schedule keys to canonical days
+        resolved_days = {}
+        for d_key, d_spec in sched.items():
+            tokens = [t.strip().lower() for t in d_key.split(",") if t.strip()]
+            for t in tokens:
+                canon = DAY_ALIASES.get(t)
+                if canon:
+                    resolved_days[canon] = d_spec
+
+        def_spec = resolved_days.get("def")
+
+        for d in ordered_days:
+            rule = resolved_days.get(d, def_spec)
+            is_today = (d == today_k)
+            marker = "*" if is_today else " "
+            day_lbl = f"{d.capitalize()}{marker}"
+
+            if rule == "off" or not rule:
+                desc = "\033[91mOFF\033[0m"
+            elif rule == "free":
+                desc = "[00:00-23:59]"
+            elif isinstance(rule, dict):
+                # Budget check
+                budget_raw = rule.get("day-budget", rule.get("daily-budget", rule.get("budget")))
+                if isinstance(budget_raw, str):
+                    m = re.match(r"^(?:(\d+)h)?(?:(\d+)m)?$", budget_raw.strip())
+                    daily_sec = ((int(m.group(1)) if m.group(1) else 0) * 3600 +
+                                 (int(m.group(2)) if m.group(2) else 0) * 60) if m else None
+                else:
+                    daily_sec = budget_raw
+
+                cap_tag = f" \033[93m(day-limit: {format_seconds_hms(daily_sec)})\033[0m" if daily_sec is not None else ""
+
+                win_strs = []
+                for w in rule.get("windows", []):
+                    w_str = w if isinstance(w, str) else w.get("range", "")
+                    m_win = re.match(r"^(\d{2}:\d{2}-\d{2}:\d{2})(?:\((.+?)\))?$", w_str.strip())
+                    if m_win:
+                        r_part = m_win.group(1)
+                        b_part = m_win.group(2)
+                        if b_part:
+                            win_strs.append(f"{r_part}\033[93m({b_part})\033[0m")
+                        else:
+                            win_strs.append(r_part)
+                    else:
+                        win_strs.append(w_str)
+
+                desc = f"[{', '.join(win_strs)}]{cap_tag}" if win_strs else "\033[91mOFF\033[0m"
+            else:
+                desc = "\033[91mOFF\033[0m"
+
+            prefix = "\033[92m>\033[0m" if is_today else " "
+            print(f"   {prefix} {day_lbl:<5} : {desc}")
+        print()
+
+    # Days Off
+    days_off_cfg = profile.get("days_off", {})
+    if days_off_cfg:
+        print("  \033[1;37m[DAYS OFF (BINARIES)]\033[0m")
+        resolved_off = {}
+        for d_key, bins in days_off_cfg.items():
+            tokens = [t.strip().lower() for t in d_key.split(",") if t.strip()]
+            for t in tokens:
+                canon = DAY_ALIASES.get(t)
+                if canon:
+                    resolved_off.setdefault(canon, []).extend(bins)
+        def_off = resolved_off.get("def", [])
+
+        for d in ordered_days:
+            bins = resolved_off.get(d, def_off)
+            if bins:
+                is_today = (d == today_k)
+                marker = "*" if is_today else " "
+                day_lbl = f"{d.capitalize()}{marker}"
+                prefix = "\033[92m>\033[0m" if is_today else " "
+                print(f"   {prefix} {day_lbl:<5} : {', '.join(bins)}")
+        print()
+
+    print("\033[95m" + "═" * 60 + "\033[0m")
+    sys.exit(0)
 
 
 def print_cli_status():
@@ -322,6 +437,9 @@ def parse_state():
 
 
 def main():
+
+    if args.week:
+        print_cli_weekly()
 
     if args.status:
         print_cli_status()

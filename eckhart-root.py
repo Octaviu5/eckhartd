@@ -268,6 +268,7 @@ def print_weekly_schedule(profiles):
     print("\033[96m[+] WEEKLY INTENTION SCHEDULE (Today: " + today_k.upper() + ")\033[0m\n")
 
     for u_id, profile in profiles.items():
+        print(f"\033[1;35m━━━ USER PROFILE: UID {u_id} ━━━\033[0m\n")
         intentions = profile.get("intentions", {})
         for name, config in intentions.items():
             print(f"  \033[1;37m[{name}]\033[0m")

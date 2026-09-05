@@ -1,6 +1,7 @@
 # Personal config — never commit your real policy
-rules.json
+eckhart-rules.json
 state.json
+TODO
 
 # Runtime socket dir
 /tmp/eckhart/

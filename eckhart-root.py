@@ -6,10 +6,12 @@ import subprocess
 import socket
 import json
 import argparse
+import sys
+import re
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RULES_PATH = os.path.join(SCRIPT_DIR, "rules.json")
+RULES_PATH = os.path.join(SCRIPT_DIR, "eckhart-rules.json")
 STATE_PATH = os.path.join(SCRIPT_DIR, "state.json")
 
 WALL_TICK_RATE = 1.0
@@ -50,6 +52,165 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
 }
 """
 
+# --- SCHEDULE PARSING & VALIDATION ---
+DURATION_REGEX = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?$")
+WINDOW_REGEX   = re.compile(r"^(\d{2}:\d{2})-(\d{2}:\d{2})(?:\((.+?)\))?$")
+DAY_ALIASES = {
+    "mon": "mon", "monday": "mon",
+    "tue": "tue", "tuesday": "tue",
+    "wed": "wed", "wednesday": "wed",
+    "thu": "thu", "thursday": "thu",
+    "fri": "fri", "friday": "fri",
+    "sat": "sat", "saturday": "sat",
+    "sun": "sun", "sunday": "sun",
+    "default": "def", "default-day": "def", "def": "def",
+}
+VALID_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+
+def parse_duration_str(dur_str):
+    """Converts '2h', '30m', '1h30m' into seconds."""
+    if not dur_str:
+        return None
+    m = DURATION_REGEX.match(dur_str.strip())
+    if not m or not any(m.groups()):
+        raise ValueError(f"Invalid duration format: '{dur_str}'")
+    hours = int(m.group(1)) if m.group(1) else 0
+    minutes = int(m.group(2)) if m.group(2) else 0
+    return hours * 3600 + minutes * 60
+
+def parse_clock_time(t_str):
+    try:
+        h, m = map(int, t_str.split(":"))
+    except Exception:
+        raise ValueError(f"Invalid time format: '{t_str}'")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        if not (h == 24 and m == 0):
+            raise ValueError(f"Time out of range: '{t_str}'")
+    return h * 3600 + m * 60
+
+def parse_window_entry(w_str):
+    """Parses '05:00-23:59' or '05:00-23:59(2h30m)'."""
+    m = WINDOW_REGEX.match(w_str.strip())
+    if not m:
+        raise ValueError(f"Invalid window format: '{w_str}'")
+    start_str, end_str, cap_str = m.group(1), m.group(2), m.group(3)
+    start_sec = parse_clock_time(start_str)
+    end_sec   = parse_clock_time(end_str)
+    if end_sec <= start_sec:
+        raise ValueError(f"Window start must be before end: '{w_str}'")
+
+    cap_sec = parse_duration_str(cap_str) if cap_str else None
+    if cap_sec is not None and cap_sec > (end_sec - start_sec):
+        raise ValueError(f"Window budget ({cap_str}) exceeds window duration: '{w_str}'")
+
+    return {
+        "range": f"{start_str}-{end_str}",
+        "budget": cap_sec,
+        "_start": start_sec,
+        "_end": end_sec,
+    }
+
+def normalize_day_spec(spec):
+    """Translates 'off', 'free', or custom dict into internal format."""
+    if spec == "off":
+        return {"daily-time-budget": 0, "time-windows": []}
+    if spec == "free":
+        return {
+            "daily-time-budget": None,
+            "time-windows": [{"range": "00:00-23:59", "budget": None}]
+        }
+    if isinstance(spec, dict):
+        budget_raw = spec.get("day-budget", spec.get("daily-budget", spec.get("budget", None)))
+        if isinstance(budget_raw, str):
+            daily_budget = parse_duration_str(budget_raw)
+        elif budget_raw is None:
+            daily_budget = None
+        else:
+            daily_budget = int(budget_raw)
+
+        raw_windows = spec.get("windows", [])
+        parsed_windows = []
+        for w in raw_windows:
+            if isinstance(w, str):
+                parsed_windows.append(parse_window_entry(w))
+            elif isinstance(w, dict) and "range" in w:
+                p = parse_window_entry(w["range"])
+                if w.get("budget") is not None:
+                    p["budget"] = parse_duration_str(w["budget"]) if isinstance(w["budget"], str) else w["budget"]
+                parsed_windows.append(p)
+            else:
+                raise ValueError(f"Invalid window definition: {w}")
+
+        parsed_windows.sort(key=lambda x: x["_start"])
+        for i in range(len(parsed_windows) - 1):
+            if parsed_windows[i]["_end"] > parsed_windows[i+1]["_start"]:
+                raise ValueError(f"Overlapping windows: {parsed_windows[i]['range']} and {parsed_windows[i+1]['range']}")
+
+        clean_windows = [{"range": w["range"], "budget": w["budget"]} for w in parsed_windows]
+        return {"daily-time-budget": daily_budget, "time-windows": clean_windows}
+
+    raise ValueError(f"Unknown day schedule format: {spec}")
+
+def validate_and_normalize_profile(u_id, profile):
+    # Normalize days_off aliases
+    if "days_off" in profile:
+        normalized_days_off = {}
+        for day_key, bin_list in profile["days_off"].items():
+            k = day_key.lower().strip()
+            tokens = [t.strip() for t in k.split(",") if t.strip()]
+
+            if len(tokens) == 1 and tokens[0] in ("default", "default-day", "def"):
+                normalized_days_off["def"] = bin_list
+                continue
+
+            for token in tokens:
+                if token not in DAY_ALIASES or DAY_ALIASES[token] == "def":
+                    raise ValueError(f"Invalid day '{token}' in 'days_off'")
+                normalized_k = DAY_ALIASES[token]
+                normalized_days_off[normalized_k] = bin_list
+        profile["days_off"] = normalized_days_off
+
+    seen_binaries = {}
+    for zone in profile.get("authorized_zones", []):
+        if not os.path.isabs(zone):
+            raise ValueError(f"authorized_zone must be an absolute path: '{zone}'")
+    for zone in profile.get("dev_zones", []):
+        if not os.path.isabs(zone):
+            raise ValueError(f"dev_zone must be an absolute path: '{zone}'")
+
+    intentions = profile.get("intentions", {})
+    if not intentions:
+        raise ValueError(f"User {u_id} has no intentions defined.")
+
+    for intent_name, config in intentions.items():
+        for b in config.get("binaries", []):
+            if b in seen_binaries:
+                raise ValueError(f"Binary '{b}' is assigned to both '{seen_binaries[b]}' and '{intent_name}'")
+            seen_binaries[b] = intent_name
+
+        schedule = config.get("schedule")
+        if schedule is not None:
+            normalized_days = {}
+            for day_key, day_spec in schedule.items():
+                k = day_key.lower().strip()
+                tokens = [t.strip() for t in k.split(",") if t.strip()]
+
+                if len(tokens) == 1 and tokens[0] in ("default", "default-day", "def"):
+                    normalized_days["def"] = normalize_day_spec(day_spec)
+                    continue
+
+                for token in tokens:
+                    if token not in DAY_ALIASES or DAY_ALIASES[token] == "def":
+                        raise ValueError(f"Invalid day '{token}' in key '{day_key}' of intention '{intent_name}'")
+                    normalized_k = DAY_ALIASES[token]
+                    normalized_days[normalized_k] = normalize_day_spec(day_spec)
+
+            if "def" not in normalized_days and set(normalized_days.keys()) != VALID_DAYS:
+                raise ValueError(f"Intention '{intent_name}' must have a 'default' rule or cover all 7 days.")
+            config["days"] = normalized_days
+        elif "days" not in config:
+            raise ValueError(f"Intention '{intent_name}' must define either 'schedule' or 'days'.")
+
 # --- TIME HELPERS ---
 def get_seconds_since_midnight():
     now = datetime.now()
@@ -86,14 +247,93 @@ def atomic_write_json(path, data):
         except:
             pass
 
+# --- SCHEDULE DISPLAY HELPERS ---
+def format_seconds(sec):
+    if sec is None:
+        return "FREE"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    if h > 0 and m > 0:
+        return f"{h}h{m}m"
+    elif h > 0:
+        return f"{h}h"
+    elif m > 0:
+        return f"{m}m"
+    return "0m"
+
+def print_weekly_schedule(profiles):
+    today_k = get_day_key()
+    ordered_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+    print("\033[96m[+] WEEKLY INTENTION SCHEDULE (Today: " + today_k.upper() + ")\033[0m\n")
+
+    for u_id, profile in profiles.items():
+        intentions = profile.get("intentions", {})
+        for name, config in intentions.items():
+            print(f"  \033[1;37m[{name}]\033[0m")
+            days_cfg = config.get("days", {})
+
+            for d in ordered_days:
+                rule = days_cfg.get(d, days_cfg.get("def"))
+                is_today = (d == today_k)
+                marker = "*" if is_today else " "
+                day_lbl = f"{d.capitalize()}{marker}"
+
+                if not rule or rule.get("daily-time-budget") == 0 or not rule.get("time-windows"):
+                    desc = "\033[91mOFF\033[0m"
+                else:
+                    daily = rule.get("daily-time-budget")
+                    cap_tag = f" \033[93m(day-limit: {format_seconds(daily)})\033[0m" if daily is not None else ""
+                    win_strs = []
+                    for w in rule.get("time-windows", []):
+                        r = w["range"]
+                        b = w.get("budget")
+                        if b is not None:
+                            b_str = f"\033[93m({format_seconds(b)})\033[0m"
+                            win_strs.append(f"{r}{b_str}")
+                        else:
+                            win_strs.append(r)
+                    desc = f"[{', '.join(win_strs)}]{cap_tag}"
+
+                prefix = "\033[92m>\033[0m" if is_today else " "
+                print(f"   {prefix} {day_lbl:<5} : {desc}")
+            print()
+
+        days_off = profile.get("days_off", {})
+        if days_off:
+            print("  \033[1;37m[DAYS OFF (BINARIES)]\033[0m")
+            for d in ordered_days:
+                bins = days_off.get(d, days_off.get("def", []))
+                if bins:
+                    is_today = (d == today_k)
+                    marker = "*" if is_today else " "
+                    day_lbl = f"{d.capitalize()}{marker}"
+                    prefix = "\033[92m>\033[0m" if is_today else " "
+                    print(f"   {prefix} {day_lbl:<5} : {', '.join(bins)}")
+            print()
+
+    print("\033[95m" + "═" * 60 + "\033[0m")
+
 # --- PERSISTENCE ---
 def load_profiles():
+    if not os.path.exists(RULES_PATH):
+        print(f"[!] Rules file not found at: {RULES_PATH}", file=sys.stderr, flush=True)
+        sys.exit(1)
     try:
         with open(RULES_PATH, "r") as f:
-            return json.load(f)
+            profiles = json.load(f)
     except Exception as e:
-        print(f"Error loading rules: {e}")
-        return {}
+        print(f"[!] JSON syntax error in {RULES_PATH}: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    try:
+        for u_id, profile in profiles.items():
+            validate_and_normalize_profile(u_id, profile)
+    except ValueError as e:
+        print(f"[!] Configuration validation error: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    return profiles
 
 def load_persistence():
     today = datetime.now().strftime("%Y-%m-%d")
@@ -109,7 +349,7 @@ def load_persistence():
 
 # --- INIT ---
 saved_data    = load_persistence()
-USER_PROFILES = load_profiles()
+USER_PROFILES = {}
 USER_STATES   = {}
 
 SOCKET_BASE_DIR = "/tmp/eckhart"
@@ -125,16 +365,20 @@ def main():
     args_parsed = parser.parse_args()
     VERBOSE = args_parsed.verbose
 
-    global last_saved_snapshot, last_save_tick, USER_STATES
+    global last_saved_snapshot, last_save_tick, USER_STATES, USER_PROFILES
 
     if os.geteuid() != 0:
         print("Root only. Use sudo.")
         return
 
+    USER_PROFILES = load_profiles()
+
     print("\033[95m" + "═" * 60 + "\033[0m")
     print("\033[95m[+] ECKHART v2.0 | STAY PRESENT.\033[0m")
     print(f"\033[93m[+] VERBOSE: {'ENABLED' if VERBOSE else 'DISABLED'}\033[0m")
     print("\033[95m" + "═" * 60 + "\033[0m")
+
+    print_weekly_schedule(USER_PROFILES)
 
     if os.path.exists(SOCKET_BASE_DIR):
         import shutil

@@ -8,8 +8,21 @@ import sys
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RULES_PATH = os.path.join(SCRIPT_DIR, "rules.json")
+RULES_PATH = os.path.join(SCRIPT_DIR, "eckhart-rules.json")
+if not os.path.exists(RULES_PATH):
+    RULES_PATH = os.path.join(SCRIPT_DIR, "rules.json")
 STATE_PATH = f"/tmp/eckhart/{os.getuid()}.state"    
+
+DAY_ALIASES = {
+    "mon": "mon", "monday": "mon",
+    "tue": "tue", "tuesday": "tue",
+    "wed": "wed", "wednesday": "wed",
+    "thu": "thu", "thursday": "thu",
+    "fri": "fri", "friday": "fri",
+    "sat": "sat", "saturday": "sat",
+    "sun": "sun", "sunday": "sun",
+    "default": "def", "default-day": "def", "def": "def",
+}
 
 # --- CONFIG ---
 UID = os.getuid()
@@ -107,7 +120,19 @@ def print_cli_status():
 
     now_sec = get_seconds_since_midnight()
     day_key = get_day_key()
-    today_blocked_bins = [b.upper() for b in days_off_cfg.get(day_key, days_off_cfg.get("def", []))]
+
+    # Expand any compound or aliased keys in days_off
+    today_blocked = []
+    def_blocked = []
+    for d_k, bins in days_off_cfg.items():
+        tokens = [t.strip().lower() for t in d_k.split(",") if t.strip()]
+        for tok in tokens:
+            canon = DAY_ALIASES.get(tok)
+            if canon == day_key:
+                today_blocked.extend(bins)
+            elif canon == "def":
+                def_blocked.extend(bins)
+    today_blocked_bins = [b.upper() for b in (today_blocked if today_blocked else def_blocked)]
 
     time_blocks = state_data.get("st_time_blocks", {})
     active_intent = state_data.get("st_intention_name")
@@ -126,15 +151,14 @@ def print_cli_status():
     depleted = []
     closed_today = []
 
-    for name, cfg in intentions_cfg.items():
-        day_rule = cfg.get("days", {}).get(day_key, cfg.get("days", {}).get("def"))
+    for name in intentions_cfg.keys():
         u_name = name.upper()
+        b_data = time_blocks.get(name)
 
-        if not day_rule:
-            closed_today.append(f"{DIM}{u_name:<12} (NO SCHEDULE){RST}")
+        if not b_data or (b_data.get("daily_budget") == 0 and not b_data.get("windows")):
+            closed_today.append(f"{DIM}{u_name}{RST}")
             continue
 
-        b_data = time_blocks.get(name, {})
         daily_budget = b_data.get("daily_budget")
         daily_used = b_data.get("daily_used", 0)
         daily_rem = float("inf") if daily_budget is None else max(0, daily_budget - daily_used)
